@@ -70,30 +70,42 @@ class WeightedFocalLoss(nn.Module):
     def forward(self, predictions, targets):
         """
         Args:
-            predictions: predicted probabilities [B, 1, H, W]
+            predictions: model predictions [B, 1, H, W] (có thể là logits hoặc probabilities)
             targets: ground truth labels [B, 1, H, W] (0 hoặc 1)
-        
+            
         Returns:
-            weighted_focal_loss: scalar loss value
+            focal_loss: computed focal loss
         """
-        # Ensure predictions are probabilities
+        # Handle both logits and probabilities
         if predictions.max() > 1.0 or predictions.min() < 0.0:
-            predictions = torch.sigmoid(predictions)
+            # Input is logits, apply sigmoid
+            probs = torch.sigmoid(predictions)
+            # Use BCE with logits for mixed precision compatibility
+            ce_loss = F.binary_cross_entropy_with_logits(predictions, targets, reduction='none')
+        else:
+            # Input is already probabilities
+            probs = predictions
+            # For mixed precision safety, avoid regular BCE
+            # Convert back to logits if needed
+            eps = 1e-7
+            probs_clamped = torch.clamp(probs, eps, 1 - eps)
+            logits = torch.log(probs_clamped / (1 - probs_clamped))
+            ce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         
         # Flatten tensors
-        predictions = predictions.view(-1)
-        targets = targets.view(-1)
+        probs_flat = probs.view(-1)
+        targets_flat = targets.view(-1)
+        ce_loss_flat = ce_loss.view(-1)
         
         # Compute focal loss components
-        ce_loss = F.binary_cross_entropy(predictions, targets, reduction='none')
-        p_t = predictions * targets + (1 - predictions) * (1 - targets)
+        p_t = probs_flat * targets_flat + (1 - probs_flat) * (1 - targets_flat)
         focal_weight = (1 - p_t) ** self.gamma
         
         # Alpha weighting
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        alpha_t = self.alpha * targets_flat + (1 - self.alpha) * (1 - targets_flat)
         
         # Weighted focal loss
-        focal_loss = alpha_t * focal_weight * ce_loss
+        focal_loss = alpha_t * focal_weight * ce_loss_flat
         
         return focal_loss.mean()
 

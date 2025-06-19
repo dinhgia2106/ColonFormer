@@ -158,17 +158,21 @@ class MetricTracker:
             dict: Dictionary chứa metrics hiện tại
         """
         if not self.dice_scores:
-            return {}
+            return {
+                'Loss': 0.0,
+                'Dice': 0.0,
+                'IoU': 0.0,
+                'Precision': 0.0,
+                'Recall': 0.0,
+            }
         
         metrics = {
             'Dice': self.dice_scores[-1],
             'IoU': self.iou_scores[-1],
             'Precision': self.precision_scores[-1],
             'Recall': self.recall_scores[-1],
+            'Loss': self.losses[-1] if self.losses else 0.0,
         }
-        
-        if self.losses:
-            metrics['Loss'] = self.losses[-1]
         
         return metrics
 

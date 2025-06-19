@@ -270,7 +270,7 @@ python train.py --backbone mit_b3 --epochs 20 --batch_size 8
 python test_experiments.py
 
 # 4. Generate paper table
-python test_experiments.py --create_paper_table
+python test_experiments.py --create_paper_tablez
 
 # 5. View results
 python test_experiments.py --summary
@@ -408,13 +408,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - SegFormer authors for the MiT backbone implementation
 - UPerNet authors for the decoder architecture
 - Medical imaging community for benchmark datasets
-
-## Contact
-
-For questions and issues, please open an issue on GitHub or contact [your-email@domain.com].
-
-## Updates
-
-- **v1.0**: Initial implementation with full paper reproduction
-- **v1.1**: Added automated testing system and experiment management
-- **v1.2**: Enhanced monitoring and visualization capabilities

@@ -42,24 +42,42 @@ class PolypDataset(Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        # Load image
+        # Load image với memory optimization
         img_path = self.image_paths[idx]
-        image = cv2.imread(img_path)
+        image = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Cannot load image: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         # Load mask
         mask_path = self.mask_paths[idx]
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Cannot load mask: {mask_path}")
         
-        # Normalize mask to 0-1
-        mask = mask.astype(np.float32) / 255.0
-        mask = (mask > 0.5).astype(np.float32)  # Binary threshold
+        # Optimize memory: use uint8 for processing, float32 only when needed
+        mask = (mask > 127).astype(np.uint8)  # Binary threshold on uint8
         
         # Apply transforms
         if self.transforms:
-            transformed = self.transforms(image=image, mask=mask)
+            # Convert mask to float32 only for transforms
+            mask_float = mask.astype(np.float32)
+            transformed = self.transforms(image=image, mask=mask_float)
             image = transformed['image']
             mask = transformed['mask']
+        else:
+            # Manual basic transforms if no augmentation
+            import torch
+            image = cv2.resize(image, (self.img_size, self.img_size))
+            mask = cv2.resize(mask, (self.img_size, self.img_size))
+            
+            # Normalize image
+            image = image.astype(np.float32) / 255.0
+            image = (image - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
+            
+            # Convert to tensors
+            image = torch.from_numpy(image.transpose(2, 0, 1)).float()
+            mask = torch.from_numpy(mask).float()
         
         # Ensure mask has correct shape [1, H, W]
         if len(mask.shape) == 2:
@@ -67,9 +85,7 @@ class PolypDataset(Dataset):
         
         return {
             'image': image,
-            'mask': mask,
-            'image_path': img_path,
-            'mask_path': mask_path
+            'mask': mask
         }
 
 
@@ -83,10 +99,11 @@ def get_transforms(img_size=352, mode='train'):
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
-            A.ShiftScaleRotate(
-                shift_limit=0.1,
-                scale_limit=0.1,
-                rotate_limit=15,
+            A.Affine(
+                scale=(0.9, 1.1),  # scale_limit=0.1 -> scale=(0.9, 1.1) 
+                translate_percent=(-0.1, 0.1),  # shift_limit=0.1
+                rotate=(-15, 15),  # rotate_limit=15
+                shear=(-5, 5),  # Add some shear for more variation
                 p=0.5
             ),
             A.OneOf([
@@ -144,6 +161,35 @@ class PolypDataModule:
         self.num_workers = num_workers
         self.val_split = val_split
         self.seed = seed
+        
+        # Check CUDA availability và setup memory optimizations
+        import torch
+        self.pin_memory = torch.cuda.is_available()
+        if not self.pin_memory:
+            print("CUDA not available, disabling pin_memory to avoid warnings")
+        
+        # Optimize num_workers for different platforms
+        if num_workers > 0:
+            try:
+                # Test if multiprocessing works
+                import multiprocessing as mp
+                mp.set_start_method('spawn', force=True)  # Better for CUDA
+            except RuntimeError:
+                pass  # Already set
+            
+            # Adjust num_workers based on system
+            import os
+            cpu_count = os.cpu_count() or 1
+            max_workers = min(cpu_count, 8)  # Cap at 8 để avoid overhead
+            
+            if num_workers > max_workers:
+                print(f"Reducing num_workers from {num_workers} to {max_workers} for better performance")
+                self.num_workers = max_workers
+            
+            # Disable on Windows if problematic
+            import platform
+            if platform.system() == 'Windows' and self.num_workers > 0:
+                print("Windows detected - consider using num_workers=0 if you encounter issues")
         
         # Load data paths
         self.train_images, self.train_masks = [], []
@@ -207,30 +253,53 @@ class PolypDataModule:
         return sorted(image_paths[:min_len]), sorted(mask_paths[:min_len])
     
     def get_train_dataloader(self):
-        """Tạo train dataloader"""
+        """Tạo train dataloader với memory optimizations"""
         transforms = get_transforms(self.img_size, mode='train')
         dataset = PolypDataset(
             self.train_images, self.train_masks, 
             self.img_size, transforms, mode='train'
         )
         
-        return DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, pin_memory=True, drop_last=True
-        )
+        # Dataloader settings based on num_workers
+        dataloader_kwargs = {
+            'dataset': dataset,
+            'batch_size': self.batch_size,
+            'shuffle': True,
+            'num_workers': self.num_workers,
+            'pin_memory': self.pin_memory,
+            'drop_last': True
+        }
+        
+        # Only add these options if num_workers > 0
+        if self.num_workers > 0:
+            dataloader_kwargs['persistent_workers'] = True
+            dataloader_kwargs['prefetch_factor'] = 2
+        
+        return DataLoader(**dataloader_kwargs)
     
     def get_val_dataloader(self):
-        """Tạo validation dataloader"""
+        """Tạo validation dataloader với memory optimizations"""
         transforms = get_transforms(self.img_size, mode='val')
         dataset = PolypDataset(
             self.val_images, self.val_masks,
             self.img_size, transforms, mode='val'
         )
         
-        return DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=False,
-            num_workers=self.num_workers, pin_memory=True
-        )
+        # Dataloader settings based on num_workers
+        dataloader_kwargs = {
+            'dataset': dataset,
+            'batch_size': self.batch_size,
+            'shuffle': False,
+            'num_workers': self.num_workers,
+            'pin_memory': self.pin_memory
+        }
+        
+        # Only add these options if num_workers > 0
+        if self.num_workers > 0:
+            dataloader_kwargs['persistent_workers'] = True
+            dataloader_kwargs['prefetch_factor'] = 2
+        
+        return DataLoader(**dataloader_kwargs)
     
     def get_test_dataloader(self, dataset_name):
         """Tạo test dataloader cho dataset cụ thể"""
@@ -264,7 +333,7 @@ class PolypDataModule:
         
         return DataLoader(
             dataset, batch_size=1, shuffle=False,
-            num_workers=self.num_workers, pin_memory=True
+            num_workers=self.num_workers, pin_memory=self.pin_memory
         )
     
     def _get_paths_from_folder(self, folder_path):
@@ -315,6 +384,21 @@ class PolypDataModule:
         print(f"  Total samples: {len(self.train_images) + len(self.val_images)}")
         print(f"  Image size: {self.img_size}x{self.img_size}")
         print(f"  Batch size: {self.batch_size}")
+        
+        print("\nDataLoader Configuration:")
+        print(f"  Num workers: {self.num_workers}")
+        print(f"  Pin memory: {self.pin_memory}")
+        print(f"  CUDA available: {self.pin_memory}")
+        
+        if len(self.train_images) == 0:
+            print("\nWarning: No training data found!")
+            print("Make sure your data directory structure is correct:")
+            print("  data/")
+            print("    TrainDataset/")
+            print("      image/")
+            print("        *.png, *.jpg, etc.")
+            print("      mask/")
+            print("        *.png, *.jpg, etc.")
 
 
 if __name__ == "__main__":

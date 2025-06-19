@@ -182,7 +182,7 @@ class ColonFormer(nn.Module):
         encoder_features = self.encoder(x)  # [F1, F2, F3, F4]
         
         # Decoder forward
-        if self.deep_supervision and self.training:
+        if self.deep_supervision:
             coarse_pred, aux_outputs, fpn_features = self.decoder(encoder_features)
         else:
             coarse_pred, fpn_features = self.decoder(encoder_features)

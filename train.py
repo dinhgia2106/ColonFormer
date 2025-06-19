@@ -35,6 +35,73 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+def find_optimal_batch_size(args, device):
+    """Tìm batch size tối ưu mà không bị OOM"""
+    from models.colonformer import ColonFormer
+    
+    print("Testing different batch sizes...")
+    batch_sizes = [2, 4, 6, 8, 12, 16]  # Start from 2 để avoid BatchNorm issues
+    optimal_batch_size = 2  # Minimum safe batch size
+    
+    for batch_size in batch_sizes:
+        try:
+            print(f"Testing batch size: {batch_size}")
+            
+            # Create test model
+            test_model = ColonFormer(
+                backbone=args.backbone,
+                num_classes=args.num_classes
+            ).to(device)
+            
+            # Set model to training mode để test realistic conditions
+            test_model.train()
+            
+            # Test forward và backward pass
+            test_input = torch.randn(batch_size, 3, args.img_size, args.img_size).to(device)
+            test_target = torch.randint(0, 2, (batch_size, 1, args.img_size, args.img_size)).float().to(device)
+            
+            # Forward pass
+            test_output = test_model(test_input)
+            if isinstance(test_output, (list, tuple)):
+                test_output = test_output[0]
+            
+            # Dummy loss
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(test_output, test_target)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Test optimizer step
+            optimizer = torch.optim.Adam(test_model.parameters(), lr=1e-4)
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # Nếu không có lỗi, batch size này OK
+            optimal_batch_size = batch_size
+            print(f"Batch size {batch_size}: OK")
+            
+            # Clean up
+            del test_model, test_input, test_target, test_output, loss, optimizer
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Batch size {batch_size}: OOM")
+                break
+            elif "Expected more than 1 value per channel" in str(e):
+                print(f"Batch size {batch_size}: BatchNorm error (too small)")
+                continue
+            else:
+                print(f"Batch size {batch_size}: Error - {str(e)}")
+                continue
+        except Exception as e:
+            print(f"Batch size {batch_size}: Unexpected error - {str(e)}")
+            continue
+    
+    print(f"Optimal batch size found: {optimal_batch_size}")
+    return optimal_batch_size
+
+
 def save_checkpoint(model, optimizer, scheduler, epoch, best_dice, 
                    save_dir, filename=None):
     """Lưu model checkpoint"""
@@ -89,6 +156,9 @@ class Trainer:
         self.save_dir = save_dir
         self.args = args
         
+        # Mixed precision scaler for CUDA
+        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+        
         # Tracking variables
         self.best_dice = 0.0
         self.start_epoch = 0
@@ -111,11 +181,14 @@ class Trainer:
             )
     
     def train_epoch(self, epoch):
-        """Train một epoch"""
+        """Train một epoch với gradient accumulation support"""
         self.model.train()
         metric_tracker = MetricTracker()
         
         epoch_start_time = time.time()
+        
+        # Gradient accumulation steps
+        accumulation_steps = getattr(self.args, 'gradient_accumulation_steps', 1)
         
         # Tạo progress bar cho batches
         pbar = tqdm(enumerate(self.train_loader), 
@@ -124,37 +197,100 @@ class Trainer:
                    unit='batch',
                    bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
         
+        # Initialize accumulated loss
+        accumulated_loss = 0.0
+        
         for batch_idx, batch in pbar:
             batch_start_time = time.time()
             
-            images = batch['image'].to(self.device)
-            masks = batch['mask'].to(self.device)
+            images = batch['image'].to(self.device, non_blocking=True)
+            masks = batch['mask'].to(self.device, non_blocking=True)
             
-            # Zero gradients
-            self.optimizer.zero_grad()
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                outputs = self.model(images)
+                
+                # Calculate loss với deep supervision
+                if isinstance(outputs, dict):
+                    # ColonFormer training mode với deep supervision
+                    main_output = outputs['main']
+                    coarse_output = outputs['coarse']
+                    aux_outputs = outputs.get('aux', [])
+                    
+                    # Main loss
+                    main_loss_result = self.criterion(main_output, masks)
+                    if isinstance(main_loss_result, tuple):
+                        main_loss = main_loss_result[0]  # Extract scalar loss
+                    else:
+                        main_loss = main_loss_result
+                    
+                    loss_total = main_loss
+                    
+                    # Coarse loss
+                    coarse_loss_result = self.criterion(coarse_output, masks)
+                    if isinstance(coarse_loss_result, tuple):
+                        coarse_loss = coarse_loss_result[0]
+                    else:
+                        coarse_loss = coarse_loss_result
+                    
+                    loss_total += 0.5 * coarse_loss
+                    
+                    # Auxiliary losses
+                    for aux_output in aux_outputs:
+                        aux_loss_result = self.criterion(aux_output, masks)
+                        if isinstance(aux_loss_result, tuple):
+                            aux_loss = aux_loss_result[0]
+                        else:
+                            aux_loss = aux_loss_result
+                        loss_total += 0.3 * aux_loss
+                    
+                    loss = loss_total
+                    
+                elif isinstance(outputs, (list, tuple)):
+                    # Legacy format - multiple outputs
+                    loss_total = 0
+                    for i, output in enumerate(outputs):
+                        loss_weight = 1.0 if i == 0 else 0.5  # Main output weight = 1.0, auxiliary = 0.5
+                        loss_result = self.criterion(output, masks)
+                        if isinstance(loss_result, tuple):
+                            loss_val = loss_result[0]
+                        else:
+                            loss_val = loss_result
+                        loss_total += loss_weight * loss_val
+                    loss = loss_total
+                    main_output = outputs[0]  # Main output for metrics
+                else:
+                    # Single output (eval mode)
+                    loss_result = self.criterion(outputs, masks)
+                    if isinstance(loss_result, tuple):
+                        loss = loss_result[0]
+                    else:
+                        loss = loss_result
+                    main_output = outputs
+                
+                # Scale loss by accumulation steps
+                loss = loss / accumulation_steps
             
-            # Forward pass
-            outputs = self.model(images)
+            accumulated_loss += loss.item()
             
-            # Calculate loss với deep supervision
-            if isinstance(outputs, (list, tuple)):
-                # Deep supervision - multiple outputs
-                loss_total = 0
-                for i, output in enumerate(outputs):
-                    loss_weight = 1.0 if i == 0 else 0.5  # Main output weight = 1.0, auxiliary = 0.5
-                    loss_total += loss_weight * self.criterion(output, masks)
-                loss = loss_total
-                main_output = outputs[0]  # Main output for metrics
+            # Mixed precision backward pass
+            if self.scaler:
+                self.scaler.scale(loss).backward()
             else:
-                loss = self.criterion(outputs, masks)
-                main_output = outputs
+                loss.backward()
             
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
-            
-            # Update metrics
-            metric_tracker.update(main_output, masks, loss.item())
+            # Update optimizer sau khi accumulate đủ gradients
+            if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                if self.scaler:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                # Update metrics với accumulated loss
+                metric_tracker.update(main_output, masks, accumulated_loss)
+                accumulated_loss = 0.0
             
             # Get current metrics
             current_metrics = metric_tracker.get_current_metrics()
@@ -174,14 +310,24 @@ class Trainer:
             cpu_memory = psutil.virtual_memory().percent
             
             # Update progress bar
-            pbar.set_postfix({
+            postfix_dict = {
                 'Loss': f'{current_metrics["Loss"]:.4f}',
                 'Dice': f'{current_metrics["Dice"]:.4f}',
                 'IoU': f'{current_metrics["IoU"]:.4f}',
                 'LR': f'{lr:.1e}',
                 'Time/batch': f'{batch_time:.2f}s',
                 'CPU': f'{cpu_memory:.1f}%'
-            })
+            }
+            
+            if accumulation_steps > 1:
+                step_in_accumulation = (batch_idx % accumulation_steps) + 1
+                postfix_dict['AccStep'] = f'{step_in_accumulation}/{accumulation_steps}'
+            
+            pbar.set_postfix(postfix_dict)
+            
+            # Clear cache periodically để avoid memory fragmentation
+            if batch_idx % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         pbar.close()
         
@@ -190,6 +336,8 @@ class Trainer:
         epoch_time = time.time() - epoch_start_time
         
         print(f'\nTrain Epoch {epoch} completed in {epoch_time:.1f}s')
+        if accumulation_steps > 1:
+            print(f'Gradient Accumulation: {accumulation_steps} steps (effective batch size: {self.args.batch_size * accumulation_steps})')
         print_metrics(epoch_metrics, "Train")
         
         self.train_losses.append(epoch_metrics['Loss'])
@@ -211,23 +359,34 @@ class Trainer:
                        bar_format='{l_bar}{bar:30}{r_bar}{bar:-30b}')
             
             for batch in pbar:
-                images = batch['image'].to(self.device)
-                masks = batch['mask'].to(self.device)
+                images = batch['image'].to(self.device, non_blocking=True)
+                masks = batch['mask'].to(self.device, non_blocking=True)
                 
-                # Forward pass
-                outputs = self.model(images)
+                # Mixed precision forward pass
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    outputs = self.model(images)
                 
                 # Get main output nếu có deep supervision
-                if isinstance(outputs, (list, tuple)):
+                if isinstance(outputs, dict):
+                    main_output = outputs['main']
+                elif isinstance(outputs, (list, tuple)):
                     main_output = outputs[0]
                 else:
                     main_output = outputs
                 
-                # Calculate loss
-                loss = self.criterion(main_output, masks)
+                    # Calculate loss
+                    loss_result = self.criterion(main_output, masks)
+                    if isinstance(loss_result, tuple):
+                        loss = loss_result[0]
+                    else:
+                        loss = loss_result
                 
                 # Update metrics
                 metric_tracker.update(main_output, masks, loss.item())
+                
+                # Clear cache every 20 batches to prevent memory buildup
+                if len(metric_tracker.losses) % 20 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # Update progress bar
                 current_metrics = metric_tracker.get_current_metrics()
@@ -403,6 +562,16 @@ def main():
     parser.add_argument('--img_size', type=int, default=352,
                         help='Image size')
     
+    # Memory optimization parameters
+    parser.add_argument('--memory_efficient', action='store_true',
+                        help='Enable memory efficient training (reduce batch size and use gradient accumulation)')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+                        help='Number of gradient accumulation steps')
+    parser.add_argument('--max_memory_gb', type=float, default=None,
+                        help='Maximum GPU memory to use (GB). Auto-adjust batch size if exceeded')
+    parser.add_argument('--auto_batch_size', action='store_true',
+                        help='Automatically find optimal batch size')
+    
     # Loss parameters
     parser.add_argument('--alpha', type=float, default=0.25,
                         help='Focal loss alpha')
@@ -439,6 +608,25 @@ def main():
     
     args = parser.parse_args()
     
+    # Memory optimization adjustments
+    if args.memory_efficient:
+        print("Memory efficient mode enabled!")
+        if args.batch_size > 2:
+            original_batch = args.batch_size
+            args.batch_size = 2  # Use batch_size = 2 for BatchNorm compatibility
+            args.gradient_accumulation_steps = max(original_batch // args.batch_size, 4)
+            print(f"Reduced batch size from {original_batch} to {args.batch_size}")
+            print(f"Set gradient accumulation steps to {args.gradient_accumulation_steps}")
+        
+        if args.img_size > 320:
+            original_size = args.img_size
+            args.img_size = 320
+            print(f"Reduced image size from {original_size} to {args.img_size}")
+        
+        # Force minimal workers for memory efficiency
+        args.num_workers = 0
+        print(f"Set num_workers to {args.num_workers} for memory efficiency")
+    
     # Set seed
     set_seed(args.seed)
     
@@ -449,6 +637,62 @@ def main():
         device = torch.device(args.device)
     
     print(f"Using device: {device}")
+    
+    # Check GPU memory và auto-adjust nếu cần
+    gpu_memory_gb = 0  # Default value for CPU
+    
+    if torch.cuda.is_available():
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"GPU Memory Available: {gpu_memory_gb:.1f} GB")
+        
+        if args.max_memory_gb and gpu_memory_gb > args.max_memory_gb:
+            print(f"GPU memory exceeds limit ({args.max_memory_gb} GB), enabling memory optimizations")
+            args.memory_efficient = True
+    else:
+        print("CUDA not available, running on CPU")
+        # Force memory efficient settings for CPU but maintain batch_size >= 2
+        args.memory_efficient = True
+        if args.batch_size < 2:
+            args.batch_size = 2  # Minimum for BatchNorm
+        else:
+            args.batch_size = min(args.batch_size, 2)  # Cap at 2 for memory
+        args.gradient_accumulation_steps = max(8 // args.batch_size, 1)
+        args.num_workers = 0
+    
+    # Aggressive memory optimization for 8GB GPUs or CPU
+    if gpu_memory_gb <= 8 or not torch.cuda.is_available():
+        if torch.cuda.is_available():
+            print(f"GPU <= 8GB detected ({gpu_memory_gb:.1f}GB), applying aggressive optimizations")
+        else:
+            print("CPU detected, applying memory optimizations")
+            
+        # Force minimal settings but ensure batch_size >= 2 for BatchNorm
+        if args.batch_size < 2:
+            args.batch_size = 2  # Minimum for BatchNorm
+        else:
+            args.batch_size = min(args.batch_size, 2)  # Cap at 2 for memory
+            
+        args.gradient_accumulation_steps = max(8 // args.batch_size, 1)  # Maintain effective batch size
+        args.num_workers = 0  # Disable multiprocessing
+        
+        # Use smaller image size if not specified
+        if args.img_size > 320:
+            print(f"Reducing image size from {args.img_size} to 320 for memory")
+            args.img_size = 320
+        
+        # Force memory efficient mode
+        args.memory_efficient = True
+        
+        print(f"Optimized settings: batch_size={args.batch_size}, gradient_accumulation={args.gradient_accumulation_steps}")
+        
+    elif gpu_memory_gb < 12 and args.batch_size > 2:
+        print("GPU < 12GB detected, reducing batch size to 2")
+        args.batch_size = 2
+        args.gradient_accumulation_steps = 4
+    elif gpu_memory_gb < 16 and args.batch_size > 4:
+        print("GPU < 16GB detected, reducing batch size to 4")
+        args.batch_size = 4
+        args.gradient_accumulation_steps = 2
     
     # Set save directory
     if args.save_dir is None:
@@ -472,6 +716,24 @@ def main():
     train_loader = data_module.get_train_dataloader()
     val_loader = data_module.get_val_dataloader()
     
+    # Auto batch size finder
+    if args.auto_batch_size:
+        print("Finding optimal batch size...")
+        args.batch_size = find_optimal_batch_size(args, device)
+        print(f"Optimal batch size found: {args.batch_size}")
+        
+        # Recreate data module với batch size mới
+        data_module = PolypDataModule(
+            data_root=args.data_root,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            val_split=args.val_split,
+            seed=args.seed
+        )
+        train_loader = data_module.get_train_dataloader()
+        val_loader = data_module.get_val_dataloader()
+    
     # Create model
     print(f"Creating model: {args.backbone}")
     model = ColonFormer(
@@ -486,6 +748,48 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Memory usage check
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Test forward pass để check memory - IMPORTANT: set eval mode để avoid BatchNorm error
+        model.eval()  # Set to eval mode để avoid BatchNorm error với batch size = 1
+        
+        # Use batch size = 2 để avoid BatchNorm issues nếu model vẫn ở training mode
+        test_batch_size = max(2, min(args.batch_size, 4))  # Use small but safe batch size
+        dummy_input = torch.randn(test_batch_size, 3, args.img_size, args.img_size).to(device)
+        
+        with torch.no_grad():
+            test_output = model(dummy_input)
+            # Handle different return formats
+            if isinstance(test_output, dict):
+                print(f"Model outputs (training mode): {list(test_output.keys())}")
+            else:
+                print(f"Model output shape (eval mode): {test_output.shape}")
+            del test_output
+        
+        model_memory = torch.cuda.max_memory_allocated() / (1024**3)
+        print(f"Model memory usage: {model_memory:.2f} GB (test batch size: {test_batch_size})")
+        
+        # Estimate total memory needed cho actual batch size
+        memory_per_sample = model_memory / test_batch_size
+        estimated_total = memory_per_sample * (args.batch_size + 2)  # +2 for gradients
+        print(f"Estimated total memory needed: {estimated_total:.2f} GB (batch size: {args.batch_size})")
+        
+        if estimated_total > gpu_memory_gb * 0.9:  # 90% threshold
+            print("WARNING: Estimated memory usage exceeds 90% of GPU memory!")
+            print("Consider reducing batch size or image size")
+            
+            # Auto-suggest safer batch size
+            safe_batch_size = int((gpu_memory_gb * 0.8) / memory_per_sample)
+            safe_batch_size = max(1, safe_batch_size)
+            print(f"SUGGESTION: Try batch size {safe_batch_size} or smaller")
+        
+        # Reset model back to training mode
+        model.train()
+        torch.cuda.empty_cache()
     
     # Create loss function
     criterion = ColonFormerLoss(
@@ -512,6 +816,11 @@ def main():
     print(f"  Optimizer: Adam (lr={args.lr})")
     print(f"  Scheduler: CosineAnnealingLR (T_max={args.epochs})")
     
+    # Memory optimization settings
+    if args.gradient_accumulation_steps > 1:
+        print(f"\nGradient Accumulation: {args.gradient_accumulation_steps} steps")
+        print(f"Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -536,6 +845,9 @@ def main():
         'num_classes': args.num_classes,
         'img_size': args.img_size,
         'batch_size': args.batch_size,
+        'effective_batch_size': args.batch_size * args.gradient_accumulation_steps,
+        'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'memory_efficient': args.memory_efficient,
         'epochs': args.epochs,
         'learning_rate': args.lr,
         'optimizer': 'Adam',
