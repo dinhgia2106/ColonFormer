@@ -251,10 +251,55 @@ class Trainer:
         """Main training loop"""
         print(f"Bắt đầu training từ epoch {self.start_epoch + 1} đến {self.args.epochs}")
         print(f"Device: {self.device}")
-        print(f"Batch size: {self.args.batch_size}")
-        print(f"Learning rate: {self.args.lr}")
-        print(f"Save directory: {self.save_dir}")
-        print("="*50)
+        
+        # In chi tiết về cấu hình mô hình và loss
+        print("\n" + "="*60)
+        print("CẤU HÌNH MÔ HÌNH VÀ TRAINING")
+        print("="*60)
+        
+        # Thông tin mô hình
+        print(f"Model: ColonFormer-{self.args.backbone}")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        # Thông tin Loss Function
+        print(f"\nLoss Configuration:")
+        print(f"  Loss Type: ColonFormerLoss (λ * L_wfocal + L_wiou)")
+        print(f"  Focal Loss Alpha (α): {self.args.alpha}")
+        print(f"  Focal Loss Gamma (γ): {self.args.gamma}")
+        print(f"  Loss Lambda (λ): {self.args.lambda_weight}")
+        print(f"  Distance Weight: Enabled (border proximity weighting)")
+        print(f"  Deep Supervision: Enabled (main + auxiliary outputs)")
+        
+        # Thông tin Training
+        print(f"\nTraining Configuration:")
+        print(f"  Optimizer: Adam")
+        print(f"  Learning Rate: {self.args.lr}")
+        print(f"  Scheduler: CosineAnnealingLR (T_max={self.args.epochs})")
+        print(f"  Batch Size: {self.args.batch_size}")
+        print(f"  Epochs: {self.args.epochs}")
+        print(f"  Image Size: {self.args.img_size}x{self.args.img_size}")
+        print(f"  Random Seed: {self.args.seed}")
+        
+        # Thông tin Data
+        print(f"\nData Configuration:")
+        print(f"  Data Root: {self.args.data_root}")
+        print(f"  Validation Split: {self.args.val_split}")
+        print(f"  Num Workers: {self.args.num_workers}")
+        print(f"  Augmentation: Enabled (flip, rotate, scale, brightness)")
+        
+        # Thông tin Device và Memory
+        print(f"\nDevice Information:")
+        print(f"  Device: {self.device}")
+        if torch.cuda.is_available():
+            print(f"  GPU: {torch.cuda.get_device_name()}")
+            print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            print(f"  CUDA Version: {torch.version.cuda}")
+        
+        print(f"  Save Directory: {self.save_dir}")
+        print("="*60)
         
         # Progress bar cho toàn bộ training
         epoch_range = range(self.start_epoch + 1, self.args.epochs + 1)
@@ -311,12 +356,20 @@ class Trainer:
             self.experiment_tracker.log_epoch_results(epoch, train_metrics, val_metrics, new_lr, epoch_time)
             self.logger.log_epoch(epoch, train_metrics, val_metrics, new_lr, epoch_time)
             
-            # Summary
+            # Summary với thông tin chi tiết
             print(f"\nEpoch {epoch} Summary:")
-            print(f"  Time: {epoch_time:.1f}s | ETA: {eta_str} | LR: {new_lr:.1e}")
-            print(f"  Train - Loss: {train_metrics['Loss']:.4f}, Dice: {train_metrics['Dice']:.4f}")
-            print(f"  Val   - Loss: {val_metrics['Loss']:.4f}, Dice: {val_metrics['mDice']:.4f}")
+            print(f"  Time: {epoch_time:.1f}s | ETA: {eta_str} | LR: {old_lr:.1e} -> {new_lr:.1e}")
+            print(f"  Train - Loss: {train_metrics['Loss']:.4f}, Dice: {train_metrics['Dice']:.4f}, IoU: {train_metrics['IoU']:.4f}")
+            print(f"  Val   - Loss: {val_metrics['Loss']:.4f}, Dice: {val_metrics['mDice']:.4f}, IoU: {val_metrics['mIoU']:.4f}")
             print(f"  Best Dice: {self.best_dice:.4f} {'[NEW]' if is_best else ''}")
+            
+            # Thông tin bộ nhớ nếu có GPU
+            if torch.cuda.is_available():
+                gpu_memory_used = torch.cuda.max_memory_allocated() / 1024**3
+                gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                print(f"  GPU Memory: {gpu_memory_used:.1f}/{gpu_memory_total:.1f} GB ({gpu_memory_used/gpu_memory_total*100:.1f}%)")
+                torch.cuda.reset_peak_memory_stats()
+            
             print("="*50)
         
         total_time = time.time() - training_start_time
@@ -436,14 +489,28 @@ def main():
     
     # Create loss function
     criterion = ColonFormerLoss(
-        alpha=args.alpha,
-        gamma=args.gamma,
-        lambda_weight=args.lambda_weight
+        focal_alpha=args.alpha,
+        focal_gamma=args.gamma,
+        loss_lambda=args.lambda_weight
     )
+    
+    # In thông tin chi tiết về loss function
+    print(f"\nCreating loss function:")
+    print(f"  Type: ColonFormerLoss")
+    print(f"  Formula: λ * L_wfocal + L_wiou")
+    print(f"  Focal Alpha (α): {args.alpha}")
+    print(f"  Focal Gamma (γ): {args.gamma}")
+    print(f"  Lambda Weight (λ): {args.lambda_weight}")
+    print(f"  Distance Weighting: Enabled")
+    print(f"  Deep Supervision: Enabled")
     
     # Create optimizer và scheduler theo plan
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    print(f"\nCreating optimizer và scheduler:")
+    print(f"  Optimizer: Adam (lr={args.lr})")
+    print(f"  Scheduler: CosineAnnealingLR (T_max={args.epochs})")
     
     # Create trainer
     trainer = Trainer(
@@ -458,14 +525,45 @@ def main():
         args=args
     )
     
-    # Log all configurations
+    # Log all configurations với thông tin chi tiết
     print("\nLogging experiment configurations...")
     trainer.experiment_tracker.log_model_config(model, f"ColonFormer-{args.backbone}")
+    
+    # Log thông tin training config với loss details
+    training_config = {
+        'model_name': f"ColonFormer-{args.backbone}",
+        'backbone': args.backbone,
+        'num_classes': args.num_classes,
+        'img_size': args.img_size,
+        'batch_size': args.batch_size,
+        'epochs': args.epochs,
+        'learning_rate': args.lr,
+        'optimizer': 'Adam',
+        'scheduler': 'CosineAnnealingLR',
+        'scheduler_T_max': args.epochs,
+        'loss_type': 'ColonFormerLoss',
+        'loss_formula': 'λ * L_wfocal + L_wiou',
+        'focal_alpha': args.alpha,
+        'focal_gamma': args.gamma,
+        'loss_lambda': args.lambda_weight,
+        'distance_weighting': True,
+        'deep_supervision': True,
+        'seed': args.seed,
+        'device': str(device),
+        'total_parameters': total_params,
+        'trainable_parameters': trainable_params,
+        'save_interval': args.save_interval,
+        'log_interval': args.log_interval
+    }
+    
+    trainer.experiment_tracker.config.update(training_config)
     trainer.experiment_tracker.log_training_config(args, optimizer, scheduler, criterion)
     trainer.experiment_tracker.log_data_config(data_module)
     trainer.experiment_tracker.save_config()
     
     print("Configuration logging completed!")
+    print(f"All parameters will be saved to: {trainer.experiment_tracker.exp_dir}")
+    print(f"Loss configuration saved for future reference and comparison!")
     
     # Start training
     trainer.train()

@@ -152,20 +152,49 @@ class ExperimentTracker:
                 
             training_config['scheduler'] = scheduler_config
         
-        # Loss function config
+        # Loss function config - Chi tiết đầy đủ
         if criterion is not None:
             loss_config = {
                 'type': criterion.__class__.__name__,
+                'description': 'ColonFormer Loss Function'
             }
             
-            # Get loss-specific parameters
+            # Get loss-specific parameters từ ColonFormerLoss
             if hasattr(criterion, 'focal_loss'):
                 loss_config['focal_alpha'] = criterion.focal_loss.alpha
                 loss_config['focal_gamma'] = criterion.focal_loss.gamma
+                loss_config['focal_description'] = f"Weighted Focal Loss với α={criterion.focal_loss.alpha}, γ={criterion.focal_loss.gamma}"
+            
+            if hasattr(criterion, 'iou_loss'):
+                loss_config['iou_description'] = "Weighted IoU Loss với distance-based weighting"
+                
             if hasattr(criterion, 'loss_lambda'):
                 loss_config['loss_lambda'] = criterion.loss_lambda
+                loss_config['formula'] = f"L_total = {criterion.loss_lambda} * L_wfocal + L_wiou"
+            
             if hasattr(criterion, 'deep_supervision'):
                 loss_config['deep_supervision'] = criterion.deep_supervision
+            else:
+                loss_config['deep_supervision'] = True  # Default cho ColonFormer
+                
+            # Thêm thông tin về distance weighting
+            loss_config['distance_weighting'] = True
+            loss_config['distance_weight_description'] = "Border proximity weighting cho IoU loss"
+            
+            # Thêm các thông số quan trọng khác
+            loss_config['components'] = [
+                "Weighted Focal Loss (classification)",
+                "Weighted IoU Loss (segmentation)",
+                "Distance-based border weighting",
+                "Deep supervision support"
+            ]
+            
+            loss_config['optimization_impact'] = [
+                "focal_alpha: Controls class imbalance weighting",
+                "focal_gamma: Controls hard example focusing", 
+                "loss_lambda: Balances focal vs IoU contribution",
+                "distance_weighting: Emphasizes polyp boundaries"
+            ]
                 
             training_config['criterion'] = loss_config
         
@@ -277,37 +306,131 @@ class ExperimentTracker:
         return summary
     
     def print_summary(self):
-        """Print experiment summary"""
-        print("\n" + "="*70)
-        print(f"EXPERIMENT SUMMARY - {self.experiment_id}")
-        print("="*70)
-        print(f"Name: {self.experiment_name}")
-        print(f"Directory: {self.exp_dir}")
+        """In summary của experiment"""
+        print("\n" + "="*80)
+        print(f"EXPERIMENT SUMMARY - {self.experiment_name}")
+        print("="*80)
         
+        # System info
+        if 'system' in self.config:
+            sys_info = self.config['system']
+            print(f"System: {sys_info.get('hostname', 'Unknown')}")
+            print(f"PyTorch: {sys_info.get('pytorch_version', 'Unknown')}")
+            if sys_info.get('cuda_available', False):
+                print(f"CUDA: {sys_info.get('cuda_version', 'Unknown')}")
+                gpu_names = sys_info.get('gpu_names', [])
+                if gpu_names:
+                    print(f"GPU: {', '.join(gpu_names)}")
+        
+        # Model info
         if 'model' in self.config:
             model_info = self.config['model']
             print(f"\nModel: {model_info.get('name', 'Unknown')}")
-            print(f"Backbone: {model_info.get('backbone', 'Unknown')}")
-            print(f"Parameters: {model_info.get('total_parameters', 0):,}")
-            print(f"Size: {model_info.get('model_size_mb', 0):.1f} MB")
+            print(f"Parameters: {model_info.get('total_parameters', 0):,} total, {model_info.get('trainable_parameters', 0):,} trainable")
+            print(f"Model Size: {model_info.get('model_size_mb', 0):.1f} MB")
+            if 'backbone' in model_info:
+                print(f"Backbone: {model_info['backbone']}")
         
+        # Loss Configuration - Chi tiết đầy đủ 
+        if 'training' in self.config and 'criterion' in self.config['training']:
+            criterion_info = self.config['training']['criterion']
+            print(f"\nLoss Configuration:")
+            print(f"  Type: {criterion_info.get('type', 'Unknown')}")
+            print(f"  Description: {criterion_info.get('description', 'N/A')}")
+            
+            if 'formula' in criterion_info:
+                print(f"  Formula: {criterion_info['formula']}")
+            
+            if 'focal_alpha' in criterion_info:
+                print(f"  Focal Alpha (α): {criterion_info['focal_alpha']}")
+            if 'focal_gamma' in criterion_info:
+                print(f"  Focal Gamma (γ): {criterion_info['focal_gamma']}")
+            if 'loss_lambda' in criterion_info:
+                print(f"  Lambda Weight (λ): {criterion_info['loss_lambda']}")
+            
+            print(f"  Deep Supervision: {criterion_info.get('deep_supervision', 'Unknown')}")
+            print(f"  Distance Weighting: {criterion_info.get('distance_weighting', 'Unknown')}")
+            
+            if 'components' in criterion_info:
+                print(f"  Components:")
+                for comp in criterion_info['components']:
+                    print(f"    - {comp}")
+            
+            if 'optimization_impact' in criterion_info:
+                print(f"  Optimization Impact:")
+                for impact in criterion_info['optimization_impact']:
+                    print(f"    - {impact}")
+        
+        # Training info
         if 'training' in self.config:
             train_info = self.config['training']
-            print(f"\nTraining:")
-            print(f"Epochs: {train_info.get('epochs', 'Unknown')}")
-            print(f"Batch Size: {train_info.get('batch_size', 'Unknown')}")
-            print(f"Learning Rate: {train_info.get('lr', 'Unknown')}")
+            print(f"\nTraining Configuration:")
+            print(f"  Epochs: {train_info.get('epochs', 'Unknown')}")
+            print(f"  Batch Size: {train_info.get('batch_size', 'Unknown')}")
+            print(f"  Learning Rate: {train_info.get('learning_rate', 'Unknown')}")
             if 'optimizer' in train_info:
-                print(f"Optimizer: {train_info['optimizer'].get('type', 'Unknown')}")
+                opt_info = train_info['optimizer']
+                print(f"  Optimizer: {opt_info.get('type', 'Unknown')} (lr={opt_info.get('lr', 'Unknown')})")
+            if 'scheduler' in train_info:
+                sch_info = train_info['scheduler']
+                print(f"  Scheduler: {sch_info.get('type', 'Unknown')}")
+                if 'T_max' in sch_info:
+                    print(f"    T_max: {sch_info['T_max']}")
         
-        if 'final' in self.results:
-            final_results = self.results['final']
-            print(f"\nResults:")
-            print(f"Best Epoch: {final_results.get('best_epoch', 'Unknown')}")
-            print(f"Best Val Dice: {final_results.get('best_val_metrics', {}).get('mDice', 0):.4f}")
-            print(f"Final Val Dice: {final_results.get('final_val_metrics', {}).get('mDice', 0):.4f}")
+        # Data info
+        if 'data' in self.config:
+            data_info = self.config['data']
+            print(f"\nData Configuration:")
+            print(f"  Data Root: {data_info.get('data_root', 'Unknown')}")
+            print(f"  Image Size: {data_info.get('img_size', 'Unknown')}")
+            print(f"  Train Size: {data_info.get('train_size', 'Unknown')}")
+            print(f"  Val Size: {data_info.get('val_size', 'Unknown')}")
+            print(f"  Val Split: {data_info.get('val_split', 'Unknown')}")
         
-        print("="*70)
+        # Results summary
+        if self.training_history:
+            print(f"\nTraining Results:")
+            best_epoch = max(self.training_history, key=lambda x: x.get('val_metrics', {}).get('mDice', 0))
+            print(f"  Best Epoch: {best_epoch.get('epoch', 'Unknown')}")
+            print(f"  Best Val Dice: {best_epoch.get('val_metrics', {}).get('mDice', 0):.4f}")
+            print(f"  Best Val IoU: {best_epoch.get('val_metrics', {}).get('mIoU', 0):.4f}")
+            print(f"  Final Train Loss: {self.training_history[-1].get('train_metrics', {}).get('Loss', 0):.4f}")
+        
+        print(f"\nExperiment Directory: {self.exp_dir}")
+        print(f"Config File: {self.config_file}")
+        print("="*80)
+    
+    def print_loss_comparison(self, other_experiments=None):
+        """In bảng so sánh loss configuration với các experiments khác"""
+        print("\n" + "="*100)
+        print("LOSS CONFIGURATION COMPARISON")
+        print("="*100)
+        
+        # Current experiment
+        if 'training' in self.config and 'criterion' in self.config['training']:
+            criterion_info = self.config['training']['criterion']
+            print(f"\nCurrent Experiment: {self.experiment_name}")
+            print(f"  Loss Type: {criterion_info.get('type', 'Unknown')}")
+            print(f"  Formula: {criterion_info.get('formula', 'N/A')}")
+            print(f"  Focal Alpha: {criterion_info.get('focal_alpha', 'N/A')}")
+            print(f"  Focal Gamma: {criterion_info.get('focal_gamma', 'N/A')}")
+            print(f"  Lambda Weight: {criterion_info.get('loss_lambda', 'N/A')}")
+            print(f"  Deep Supervision: {criterion_info.get('deep_supervision', 'N/A')}")
+            print(f"  Distance Weighting: {criterion_info.get('distance_weighting', 'N/A')}")
+        
+        # Other experiments (if provided)
+        if other_experiments:
+            for i, exp in enumerate(other_experiments):
+                print(f"\nComparison Experiment {i+1}: {exp.get('name', 'Unknown')}")
+                criterion_info = exp.get('criterion', {})
+                print(f"  Loss Type: {criterion_info.get('type', 'Unknown')}")
+                print(f"  Formula: {criterion_info.get('formula', 'N/A')}")
+                print(f"  Focal Alpha: {criterion_info.get('focal_alpha', 'N/A')}")
+                print(f"  Focal Gamma: {criterion_info.get('focal_gamma', 'N/A')}")
+                print(f"  Lambda Weight: {criterion_info.get('loss_lambda', 'N/A')}")
+                print(f"  Performance: {exp.get('best_dice', 'N/A')}")
+        
+        print("="*100)
 
 
 def load_experiment(experiment_dir):
