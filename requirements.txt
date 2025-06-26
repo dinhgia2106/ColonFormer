@@ -1,13 +1,30 @@
-torch>=1.9.0
-torchvision>=0.10.0
+# Core PyTorch dependencies
+torch>=1.12.0
+torchvision>=0.13.0
+
+# MMCV and MMSegmentation
+mmcv-full>=1.1.4,<=1.3.0
+# mmsegmentation  # Will install from local source
+
+# Computer Vision
 opencv-python>=4.5.0
-numpy>=1.21.0
+pillow>=8.0.0
+
+# Scientific Computing
+numpy>=1.19.0
 scikit-learn>=1.0.0
-timm>=0.6.0
-tqdm>=4.62.0
-matplotlib>=3.5.0
-Pillow>=8.3.0
-albumentations>=1.1.0
-psutil>=5.8.0
-pandas>=1.3.0
-scipy>=1.7.0 
+
+# Data Augmentation
+albumentations>=1.0.0
+
+# Visualization and Logging
+matplotlib>=3.3.0
+tensorboard>=2.8.0
+tqdm>=4.60.0
+
+# Transformers and Advanced Models  
+timm>=0.6.12
+einops>=0.4.0
+
+# Optional dependencies
+fvcore  # For some model components

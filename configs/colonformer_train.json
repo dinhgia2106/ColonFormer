@@ -1,0 +1,35 @@
+{
+  "model": {
+    "backbone": "mit_b3",
+    "decoder_channels": 128,
+    "use_refinement": true,
+    "deep_supervision": true
+  },
+  "data": {
+    "img_size": 352,
+    "val_split": 0.2,
+    "num_workers": 4
+  },
+  "training": {
+    "epochs": 100,
+    "batch_size": 8,
+    "learning_rate": 1e-4,
+    "weight_decay": 1e-4,
+    "num_workers": 4,
+    "scheduler": {
+      "type": "warmup_cosine",
+      "warmup_epochs": 5,
+      "eta_min": 1e-6
+    }
+  },
+  "loss": {
+    "focal_alpha": 0.25,
+    "focal_gamma": 2.0,
+    "iou_weight": 5.0
+  },
+  "experiment": {
+    "name": "colonformer_b3_baseline",
+    "description": "ColonFormer với MiT-B3 backbone và refinement module",
+    "tags": ["colonformer", "mit_b3", "polyp_segmentation"]
+  }
+}

@@ -1,273 +1,311 @@
 """
-Evaluation metrics cho Polyp Segmentation
-Bao gồm: mDice, mIoU, Recall, Precision
+Evaluation metrics for ColonFormer
+Implementation of common segmentation metrics
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-from sklearn.metrics import precision_score, recall_score
+from sklearn.metrics import precision_recall_curve, auc
 
 
-def dice_coefficient(pred, target, smooth=1e-6):
+def calculate_metrics(predictions, targets, threshold=0.5, smooth=1e-7):
     """
-    Tính Dice coefficient
+    Calculate comprehensive metrics for binary segmentation
+    
     Args:
-        pred: prediction tensor (B, 1, H, W) hoặc (B, H, W)
-        target: ground truth tensor (B, 1, H, W) hoặc (B, H, W)
+        predictions: predicted probabilities [B, 1, H, W] (0-1)
+        targets: ground truth masks [B, 1, H, W] (0-1)
+        threshold: threshold for binary prediction
         smooth: smoothing factor
+    
     Returns:
-        dice: Dice coefficient
+        dict: metrics dictionary
     """
-    # Ensure tensors are on same device
-    pred = pred.float()
-    target = target.float()
+    # Convert to binary predictions
+    preds_binary = (predictions > threshold).float()
     
-    # Flatten tensors
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
+    # Flatten tensors for calculation
+    preds_flat = predictions.view(-1)
+    targets_flat = targets.view(-1)
+    preds_binary_flat = preds_binary.view(-1)
     
-    # Calculate intersection
-    intersection = (pred_flat * target_flat).sum()
+    # True Positives, False Positives, False Negatives
+    tp = (preds_binary_flat * targets_flat).sum()
+    fp = (preds_binary_flat * (1 - targets_flat)).sum()
+    fn = ((1 - preds_binary_flat) * targets_flat).sum()
+    tn = ((1 - preds_binary_flat) * (1 - targets_flat)).sum()
     
-    # Calculate Dice
-    dice = (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+    # Dice Score (F1-Score)
+    dice = (2 * tp + smooth) / (2 * tp + fp + fn + smooth)
     
-    return dice
+    # IoU (Jaccard Index)
+    iou = (tp + smooth) / (tp + fp + fn + smooth)
+    
+    # Precision
+    precision = (tp + smooth) / (tp + fp + smooth)
+    
+    # Recall (Sensitivity)
+    recall = (tp + smooth) / (tp + fn + smooth)
+    
+    # Specificity
+    specificity = (tn + smooth) / (tn + fp + smooth)
+    
+    # Accuracy
+    accuracy = (tp + tn + smooth) / (tp + tn + fp + fn + smooth)
+    
+    # F2 Score (weighted towards recall)
+    f2 = (5 * tp + smooth) / (5 * tp + 4 * fn + fp + smooth)
+    
+    return {
+        'dice': dice.item(),
+        'iou': iou.item(),
+        'precision': precision.item(),
+        'recall': recall.item(),
+        'specificity': specificity.item(),
+        'accuracy': accuracy.item(),
+        'f2': f2.item()
+    }
 
 
-def iou_coefficient(pred, target, smooth=1e-6):
+def calculate_hausdorff_distance(pred, target, spacing=None):
     """
-    Tính IoU (Intersection over Union)
+    Calculate Hausdorff distance between prediction and target
+    
     Args:
-        pred: prediction tensor (B, 1, H, W) hoặc (B, H, W)
-        target: ground truth tensor (B, 1, H, W) hoặc (B, H, W)
-        smooth: smoothing factor
+        pred: binary prediction [H, W]
+        target: binary target [H, W]
+        spacing: pixel spacing, default (1, 1)
+    
     Returns:
-        iou: IoU coefficient
+        float: Hausdorff distance
     """
-    # Ensure tensors are on same device
-    pred = pred.float()
-    target = target.float()
+    try:
+        from scipy.spatial.distance import directed_hausdorff
+        
+        if spacing is None:
+            spacing = [1, 1]
+        
+        # Convert to numpy and get coordinates of boundary points
+        pred_np = pred.cpu().numpy().astype(bool)
+        target_np = target.cpu().numpy().astype(bool)
+        
+        # Get boundary points
+        pred_points = np.argwhere(pred_np) * spacing
+        target_points = np.argwhere(target_np) * spacing
+        
+        if len(pred_points) == 0 or len(target_points) == 0:
+            return float('inf')
+        
+        # Calculate directed Hausdorff distances
+        hd1 = directed_hausdorff(pred_points, target_points)[0]
+        hd2 = directed_hausdorff(target_points, pred_points)[0]
+        
+        return max(hd1, hd2)
     
-    # Flatten tensors
-    pred_flat = pred.view(-1)
-    target_flat = target.view(-1)
-    
-    # Calculate intersection and union
-    intersection = (pred_flat * target_flat).sum()
-    union = pred_flat.sum() + target_flat.sum() - intersection
-    
-    # Calculate IoU
-    iou = (intersection + smooth) / (union + smooth)
-    
-    return iou
+    except ImportError:
+        # Fallback if scipy is not available
+        return 0.0
 
 
-def precision_recall(pred, target):
+def calculate_mae(predictions, targets):
     """
-    Tính Precision và Recall
+    Calculate Mean Absolute Error
+    
     Args:
-        pred: prediction tensor (B, 1, H, W) hoặc (B, H, W)
-        target: ground truth tensor (B, 1, H, W) hoặc (B, H, W)
-    Returns:
-        precision: Precision score
-        recall: Recall score
-    """
-    # Convert to numpy
-    pred_np = pred.detach().cpu().numpy().flatten()
-    target_np = target.detach().cpu().numpy().flatten()
+        predictions: predicted probabilities [B, 1, H, W]
+        targets: ground truth masks [B, 1, H, W]
     
+    Returns:
+        float: MAE value
+    """
+    mae = torch.mean(torch.abs(predictions - targets))
+    return mae.item()
+
+
+def calculate_enhanced_metrics(predictions, targets, threshold=0.5):
+    """
+    Calculate enhanced metrics including boundary-aware metrics
+    
+    Args:
+        predictions: predicted probabilities [B, 1, H, W]
+        targets: ground truth masks [B, 1, H, W]
+        threshold: threshold for binary prediction
+    
+    Returns:
+        dict: enhanced metrics dictionary
+    """
+    basic_metrics = calculate_metrics(predictions, targets, threshold)
+    
+    # Calculate MAE
+    mae = calculate_mae(predictions, targets)
+    
+    # Boundary IoU (IoU calculated only on boundary regions)
+    boundary_iou = calculate_boundary_iou(predictions, targets, threshold)
+    
+    # Enhanced metrics
+    enhanced_metrics = basic_metrics.copy()
+    enhanced_metrics.update({
+        'mae': mae,
+        'boundary_iou': boundary_iou
+    })
+    
+    return enhanced_metrics
+
+
+def calculate_boundary_iou(predictions, targets, threshold=0.5, kernel_size=3):
+    """
+    Calculate IoU specifically for boundary regions
+    
+    Args:
+        predictions: predicted probabilities [B, 1, H, W]
+        targets: ground truth masks [B, 1, H, W]
+        threshold: threshold for binary prediction
+        kernel_size: kernel size for boundary extraction
+    
+    Returns:
+        float: boundary IoU
+    """
     # Convert to binary
-    pred_binary = (pred_np > 0.5).astype(int)
-    target_binary = (target_np > 0.5).astype(int)
+    preds_binary = (predictions > threshold).float()
     
-    # Calculate precision and recall
-    precision = precision_score(target_binary, pred_binary, zero_division=0)
-    recall = recall_score(target_binary, pred_binary, zero_division=0)
+    # Extract boundaries using morphological operations
+    def get_boundary(mask):
+        # Erosion
+        eroded = F.max_pool2d(-mask, kernel_size, stride=1, padding=kernel_size//2)
+        eroded = -eroded
+        # Boundary = original - eroded
+        boundary = mask - eroded
+        return (boundary > 0).float()
     
-    return precision, recall
+    pred_boundary = get_boundary(preds_binary)
+    target_boundary = get_boundary(targets)
+    
+    # Calculate IoU on boundaries
+    intersection = (pred_boundary * target_boundary).sum()
+    union = (pred_boundary + target_boundary - pred_boundary * target_boundary).sum()
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    boundary_iou = intersection / union
+    return boundary_iou.item()
 
 
-class MetricTracker:
-    """
-    Class để theo dõi metrics qua các epochs
-    """
+class MetricsTracker:
+    """Track metrics across multiple batches"""
+    
     def __init__(self):
         self.reset()
     
     def reset(self):
-        """Reset tất cả metrics"""
-        self.dice_scores = []
-        self.iou_scores = []
-        self.precision_scores = []
-        self.recall_scores = []
-        self.losses = []
+        """Reset all accumulated metrics"""
+        self.metrics = {
+            'dice': [],
+            'iou': [],
+            'precision': [],
+            'recall': [],
+            'specificity': [],
+            'accuracy': [],
+            'f2': [],
+            'mae': [],
+            'boundary_iou': []
+        }
     
-    def update(self, pred, target, loss=None):
-        """
-        Update metrics với prediction mới
-        Args:
-            pred: prediction tensor
-            target: ground truth tensor
-            loss: loss value (optional)
-        """
-        # Apply sigmoid if needed (for logits)
-        if pred.max() > 1.0 or pred.min() < 0.0:
-            pred = torch.sigmoid(pred)
+    def update(self, predictions, targets, threshold=0.5):
+        """Update metrics with new batch"""
+        batch_metrics = calculate_enhanced_metrics(predictions, targets, threshold)
         
-        # Apply threshold
-        pred_binary = (pred > 0.5).float()
-        
-        # Calculate metrics
-        dice = dice_coefficient(pred_binary, target)
-        iou = iou_coefficient(pred_binary, target)
-        precision, recall = precision_recall(pred_binary, target)
-        
-        # Store metrics
-        self.dice_scores.append(dice.item())
-        self.iou_scores.append(iou.item())
-        self.precision_scores.append(precision)
-        self.recall_scores.append(recall)
-        
-        if loss is not None:
-            self.losses.append(loss)
+        for key, value in batch_metrics.items():
+            if key in self.metrics:
+                self.metrics[key].append(value)
     
     def get_average_metrics(self):
-        """
-        Tính trung bình của tất cả metrics
-        Returns:
-            dict: Dictionary chứa các metrics trung bình
-        """
-        metrics = {
-            'mDice': np.mean(self.dice_scores) if self.dice_scores else 0.0,
-            'mIoU': np.mean(self.iou_scores) if self.iou_scores else 0.0,
-            'Precision': np.mean(self.precision_scores) if self.precision_scores else 0.0,
-            'Recall': np.mean(self.recall_scores) if self.recall_scores else 0.0,
-        }
+        """Get average metrics across all batches"""
+        avg_metrics = {}
+        for key, values in self.metrics.items():
+            if values:
+                avg_metrics[key] = np.mean(values)
+                avg_metrics[f'{key}_std'] = np.std(values)
+            else:
+                avg_metrics[key] = 0.0
+                avg_metrics[f'{key}_std'] = 0.0
         
-        if self.losses:
-            metrics['Loss'] = np.mean(self.losses)
-        
-        return metrics
+        return avg_metrics
     
-    def get_current_metrics(self):
-        """
-        Lấy metrics của batch cuối cùng
-        Returns:
-            dict: Dictionary chứa metrics hiện tại
-        """
-        if not self.dice_scores:
-            return {
-                'Loss': 0.0,
-                'Dice': 0.0,
-                'IoU': 0.0,
-                'Precision': 0.0,
-                'Recall': 0.0,
-            }
+    def get_best_metrics(self):
+        """Get best metrics across all batches"""
+        best_metrics = {}
+        for key, values in self.metrics.items():
+            if values:
+                best_metrics[f'best_{key}'] = np.max(values)
+            else:
+                best_metrics[f'best_{key}'] = 0.0
         
-        metrics = {
-            'Dice': self.dice_scores[-1],
-            'IoU': self.iou_scores[-1],
-            'Precision': self.precision_scores[-1],
-            'Recall': self.recall_scores[-1],
-            'Loss': self.losses[-1] if self.losses else 0.0,
-        }
-        
-        return metrics
+        return best_metrics
 
 
-def evaluate_model(model, dataloader, device, criterion=None):
+def calculate_pr_auc(predictions, targets):
     """
-    Đánh giá model trên validation/test set
+    Calculate Precision-Recall AUC
+    
     Args:
-        model: PyTorch model
-        dataloader: DataLoader
-        device: device để chạy
-        criterion: loss function (optional)
+        predictions: predicted probabilities [B, 1, H, W]
+        targets: ground truth masks [B, 1, H, W]
+    
     Returns:
-        dict: Dictionary chứa các metrics
+        float: PR-AUC value
+    """
+    # Flatten
+    preds_flat = predictions.view(-1).cpu().numpy()
+    targets_flat = targets.view(-1).cpu().numpy()
+    
+    # Calculate precision-recall curve
+    precision, recall, _ = precision_recall_curve(targets_flat, preds_flat)
+    
+    # Calculate AUC
+    pr_auc = auc(recall, precision)
+    
+    return pr_auc
+
+
+def calculate_dataset_metrics(model, dataloader, device, threshold=0.5):
+    """
+    Calculate metrics across entire dataset
+    
+    Args:
+        model: trained model
+        dataloader: data loader
+        device: computation device
+        threshold: binary threshold
+    
+    Returns:
+        dict: comprehensive metrics
     """
     model.eval()
-    metric_tracker = MetricTracker()
+    tracker = MetricsTracker()
     
     with torch.no_grad():
-        for batch in dataloader:
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
+        for images, masks in dataloader:
+            images = images.to(device)
+            masks = masks.to(device)
             
             # Forward pass
             outputs = model(images)
-            
-            # Handle multiple outputs (deep supervision)
-            if isinstance(outputs, (list, tuple)):
-                # Take the final output for evaluation
-                pred = outputs[0]
+            if isinstance(outputs, list):
+                predictions = torch.sigmoid(outputs[0])
             else:
-                pred = outputs
-            
-            # Calculate loss if criterion provided
-            loss = None
-            if criterion is not None:
-                if isinstance(outputs, (list, tuple)):
-                    # Deep supervision loss
-                    loss_total = 0
-                    for output in outputs:
-                        loss_total += criterion(output, masks)
-                    loss = loss_total / len(outputs)
-                else:
-                    loss = criterion(pred, masks)
-                loss = loss.item()
+                predictions = torch.sigmoid(outputs)
             
             # Update metrics
-            metric_tracker.update(pred, masks, loss)
+            tracker.update(predictions, masks, threshold)
     
-    return metric_tracker.get_average_metrics()
-
-
-def print_metrics(metrics, prefix=""):
-    """
-    In metrics một cách đẹp mắt
-    Args:
-        metrics: Dictionary chứa metrics
-        prefix: Prefix cho output (ví dụ: "Train", "Val")
-    """
-    if prefix:
-        prefix += " "
+    # Get comprehensive results
+    avg_metrics = tracker.get_average_metrics()
+    best_metrics = tracker.get_best_metrics()
     
-    output_lines = []
-    for key, value in metrics.items():
-        if key == 'Loss':
-            output_lines.append(f"{prefix}{key}: {value:.4f}")
-        else:
-            output_lines.append(f"{prefix}{key}: {value:.4f}")
+    # Combine results
+    final_metrics = avg_metrics.copy()
+    final_metrics.update(best_metrics)
     
-    print(" | ".join(output_lines))
-
-
-if __name__ == "__main__":
-    # Test metrics
-    import torch
-    
-    # Create dummy data
-    pred = torch.rand(2, 1, 352, 352)
-    target = torch.randint(0, 2, (2, 1, 352, 352)).float()
-    
-    # Test individual metrics
-    dice = dice_coefficient(pred, target)
-    iou = iou_coefficient(pred, target)
-    precision, recall = precision_recall(pred, target)
-    
-    print(f"Dice: {dice:.4f}")
-    print(f"IoU: {iou:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    
-    # Test metric tracker
-    tracker = MetricTracker()
-    tracker.update(pred, target, loss=0.5)
-    
-    metrics = tracker.get_average_metrics()
-    print_metrics(metrics, "Test")
-    
-    print("Metrics test completed!") 
+    return final_metrics 
