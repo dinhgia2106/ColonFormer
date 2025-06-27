@@ -7,39 +7,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from timm.models.registry import register_model
-from timm.models.vision_transformer import _cfg
-
-# Try mmcv imports, fallback if not available
-try:
-    from mmseg.models.builder import BACKBONES
-    from mmseg.utils import get_root_logger
-    from mmcv.runner import load_checkpoint
-    MMCV_AVAILABLE = True
-except ImportError:
-    MMCV_AVAILABLE = False
-    # Dummy decorator for standalone use
-    def BACKBONES_register_module():
-        def decorator(cls):
-            return cls
-        return decorator
-    
-    # Mock BACKBONES
-    class BACKBONES:
-        @staticmethod
-        def register_module():
-            return BACKBONES_register_module()
-    
-    def get_root_logger():
-        import logging
-        return logging.getLogger()
-    
-    def load_checkpoint(model, checkpoint, map_location=None, strict=True, logger=None):
-        pass
-
 import math
+
+try:
+    from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+except ImportError:
+    # Fallback implementations if timm not available
+    def to_2tuple(x):
+        if isinstance(x, (list, tuple)):
+            return tuple(x)
+        return (x, x)
+    
+    def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+        def norm_cdf(x):
+            return (1. + math.erf(x / math.sqrt(2.))) / 2.
+        
+        l = norm_cdf((a - mean) / std)
+        u = norm_cdf((b - mean) / std)
+        
+        tensor.uniform_(2 * l - 1, 2 * u - 1)
+        tensor.erfinv_()
+        tensor.mul_(std * math.sqrt(2.))
+        tensor.add_(mean)
+        tensor.clamp_(min=a, max=b)
+        return tensor
+    
+    class DropPath(nn.Module):
+        """Drop paths (Stochastic Depth) per sample"""
+        def __init__(self, drop_prob=None):
+            super(DropPath, self).__init__()
+            self.drop_prob = drop_prob
+
+        def forward(self, x):
+            if self.drop_prob == 0. or not self.training:
+                return x
+            keep_prob = 1 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            random_tensor.floor_()
+            output = x.div(keep_prob) * random_tensor
+            return output
 
 
 class Mlp(nn.Module):
@@ -143,7 +150,6 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1):
         super().__init__()
@@ -152,7 +158,6 @@ class Block(nn.Module):
             dim,
             num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
             attn_drop=attn_drop, proj_drop=drop, sr_ratio=sr_ratio)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -178,14 +183,11 @@ class Block(nn.Module):
     def forward(self, x, H, W):
         x = x + self.drop_path(self.attn(self.norm1(x), H, W))
         x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
-
         return x
 
 
 class OverlapPatchEmbed(nn.Module):
-    """ Image to Patch Embedding
-    """
-
+    """Image to Patch Embedding"""
     def __init__(self, img_size=224, patch_size=7, stride=4, in_chans=3, embed_dim=768):
         super().__init__()
         img_size = to_2tuple(img_size)
@@ -221,7 +223,6 @@ class OverlapPatchEmbed(nn.Module):
         _, _, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
-
         return x, H, W
 
 
@@ -245,7 +246,7 @@ class MixVisionTransformer(nn.Module):
                                               embed_dim=embed_dims[3])
 
         # transformer encoder
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
         self.block1 = nn.ModuleList([Block(
             dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratios[0], qkv_bias=qkv_bias, qk_scale=qk_scale,
@@ -278,9 +279,6 @@ class MixVisionTransformer(nn.Module):
             for i in range(depths[3])])
         self.norm4 = norm_layer(embed_dims[3])
 
-        # classification head
-        # self.head = nn.Linear(embed_dims[3], num_classes) if num_classes > 0 else nn.Identity()
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -297,43 +295,6 @@ class MixVisionTransformer(nn.Module):
             m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
             if m.bias is not None:
                 m.bias.data.zero_()
-
-    def init_weights(self, pretrained=None):
-        if isinstance(pretrained, str) and MMCV_AVAILABLE:
-            logger = get_root_logger()
-            load_checkpoint(self, pretrained, map_location='cpu', strict=False, logger=logger)
-
-    def reset_drop_path(self, drop_path_rate):
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(self.depths))]
-        cur = 0
-        for i in range(self.depths[0]):
-            self.block1[i].drop_path.drop_prob = dpr[cur + i]
-
-        cur += self.depths[0]
-        for i in range(self.depths[1]):
-            self.block2[i].drop_path.drop_prob = dpr[cur + i]
-
-        cur += self.depths[1]
-        for i in range(self.depths[2]):
-            self.block3[i].drop_path.drop_prob = dpr[cur + i]
-
-        cur += self.depths[2]
-        for i in range(self.depths[3]):
-            self.block4[i].drop_path.drop_prob = dpr[cur + i]
-
-    def freeze_patch_emb(self):
-        self.patch_embed1.requires_grad = False
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {'pos_embed1', 'pos_embed2', 'pos_embed3', 'pos_embed4', 'cls_token'}  # has pos_embed may be better
-
-    def get_classifier(self):
-        return self.head
-
-    def reset_classifier(self, num_classes, global_pool=''):
-        self.num_classes = num_classes
-        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
         B = x.shape[0]
@@ -375,8 +336,6 @@ class MixVisionTransformer(nn.Module):
 
     def forward(self, x):
         x = self.forward_features(x)
-        # x = self.head(x)
-
         return x
 
 
@@ -390,12 +349,10 @@ class DWConv(nn.Module):
         x = x.transpose(1, 2).view(B, C, H, W)
         x = self.dwconv(x)
         x = x.flatten(2).transpose(1, 2)
-
         return x
 
 
-
-@BACKBONES.register_module()
+# Standalone MiT variants
 class mit_b0(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b0, self).__init__(
@@ -404,7 +361,6 @@ class mit_b0(MixVisionTransformer):
             drop_rate=0.0, drop_path_rate=0.1)
 
 
-@BACKBONES.register_module()
 class mit_b1(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b1, self).__init__(
@@ -413,7 +369,6 @@ class mit_b1(MixVisionTransformer):
             drop_rate=0.0, drop_path_rate=0.1)
 
 
-@BACKBONES.register_module()
 class mit_b2(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b2, self).__init__(
@@ -422,24 +377,14 @@ class mit_b2(MixVisionTransformer):
             drop_rate=0.0, drop_path_rate=0.1)
 
 
-@BACKBONES.register_module()
 class mit_b3(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b3, self).__init__(
             patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[4, 4, 4, 4],
             qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 18, 3], sr_ratios=[8, 4, 2, 1],
             drop_rate=0.0, drop_path_rate=0.1)
-            
-@BACKBONES.register_module()
-class hybrid_mit_b3(MixVisionTransformer):
-    def __init__(self, **kwargs):
-        super(hybrid_mit_b3, self).__init__(
-            in_chans=451, patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[4, 4, 4, 4],
-            qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 4, 18, 3], sr_ratios=[8, 4, 2, 1],
-            drop_rate=0.0, drop_path_rate=0.1)
 
 
-@BACKBONES.register_module()
 class mit_b4(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b4, self).__init__(
@@ -448,10 +393,9 @@ class mit_b4(MixVisionTransformer):
             drop_rate=0.0, drop_path_rate=0.1)
 
 
-@BACKBONES.register_module()
 class mit_b5(MixVisionTransformer):
     def __init__(self, **kwargs):
         super(mit_b5, self).__init__(
             patch_size=4, embed_dims=[64, 128, 320, 512], num_heads=[1, 2, 5, 8], mlp_ratios=[4, 4, 4, 4],
             qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), depths=[3, 6, 40, 3], sr_ratios=[8, 4, 2, 1],
-            drop_rate=0.0, drop_path_rate=0.1)
+            drop_rate=0.0, drop_path_rate=0.1) 

@@ -34,7 +34,7 @@ except ImportError:
         from mmcv.runner import load_checkpoint
         MMCV_AVAILABLE = True
     except ImportError:
-        print("Warning: mmcv not found, using standalone mode")
+        # print("Warning: mmcv not found, using standalone mode")
         MMCVConfig = None
         load_checkpoint = None
         MMCV_AVAILABLE = False
@@ -48,7 +48,7 @@ try:
     import conv_layer
     Conv = conv_layer.Conv
     BNPReLU = conv_layer.BNPReLU
-    print("Using original Conv, BNPReLU from mmseg lib")
+    # print("Using original Conv, BNPReLU from mmseg lib")
     
     # Define self_attn từ code gốc với fixed import
     class self_attn(nn.Module):
@@ -188,7 +188,7 @@ try:
             
             return output+input
     
-    print("Using original mmseg lib modules with fixed imports")
+    # print("Using original mmseg lib modules with fixed imports")
     
 except ImportError:
     print("Warning: mmseg lib modules not found, using fallback standalone implementations")
@@ -275,6 +275,11 @@ class Config:
         self.weight_decay = args.weight_decay
         self.img_size = args.img_size
         
+        # Anti-overfitting configs
+        self.dropout = args.dropout
+        self.early_stopping = args.early_stopping
+        self.min_lr = args.min_lr
+        
         # Loss configs
         self.loss_type = args.loss_type
         self.focal_alpha = args.focal_alpha
@@ -334,6 +339,99 @@ class Config:
 # SIMPLE BACKBONE - Để replace cho MiT khi không có mmcv
 # =========================================================================
 
+class TinyBackbone(nn.Module):
+    """Tiny backbone để chống overfitting - 2.5M params"""
+    
+    def __init__(self):
+        super(TinyBackbone, self).__init__()
+        
+        # Stage 1: 3 -> 32 (stride 4) 
+        self.stage1 = nn.Sequential(
+            nn.Conv2d(3, 32, 7, 4, 3),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Stage 2: 32 -> 64 (stride 2, total /8)
+        self.stage2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, 2, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Stage 3: 64 -> 128 (stride 2, total /16)
+        self.stage3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 2, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Stage 4: 128 -> 256 (stride 2, total /32)
+        self.stage4 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 2, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+    
+    def forward(self, x):
+        x1 = self.stage1(x)    # [B, 32, H/4, W/4]
+        x2 = self.stage2(x1)   # [B, 64, H/8, W/8]
+        x3 = self.stage3(x2)   # [B, 128, H/16, W/16]
+        x4 = self.stage4(x3)   # [B, 256, H/32, W/32]
+        
+        return [x1, x2, x3, x4]
+
+
+def build_backbone(backbone_name):
+    """Build backbone based on name - KẾ THỪA TỪ CODE GỐC MMSEG"""
+    if backbone_name == 'mit_b0':
+        # MiT-B0: 3.7M params - smallest
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b0_clean
+        return mit_b0_clean(), [32, 64, 160, 256]
+    elif backbone_name == 'mit_b1':
+        # MiT-B1: 13.7M params
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b1_clean
+        return mit_b1_clean(), [64, 128, 320, 512]
+    elif backbone_name == 'mit_b2':
+        # MiT-B2: 25.4M params
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b2_clean
+        return mit_b2_clean(), [64, 128, 320, 512]
+    elif backbone_name == 'mit_b3':
+        # MiT-B3: 45M params - ORIGINAL PAPER
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b3_clean
+        return mit_b3_clean(), [64, 128, 320, 512]
+    elif backbone_name == 'mit_b4':
+        # MiT-B4: 62M params
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b4_clean
+        return mit_b4_clean(), [64, 128, 320, 512]
+    elif backbone_name == 'mit_b5':
+        # MiT-B5: 82M params - LARGEST
+        import sys
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'mmseg', 'models', 'backbones'))
+        from mix_transformer_clean import mit_b5_clean
+        return mit_b5_clean(), [64, 128, 320, 512]
+    elif backbone_name == 'tiny':
+        return TinyBackbone(), [32, 64, 128, 256]
+    elif backbone_name == 'simple':
+        return SimpleBackbone(), [64, 128, 320, 512]
+    else:
+        # Default fallback
+        return TinyBackbone(), [32, 64, 128, 256]
+
+
+
+
+
 class SimpleBackbone(nn.Module):
     """Simple backbone thay thế cho MiT khi không có mmcv"""
     
@@ -390,12 +488,13 @@ class SimpleBackbone(nn.Module):
 class SimpleDecodeHead(nn.Module):
     """Simple decode head tương tự SegFormer"""
     
-    def __init__(self, in_channels=[64, 128, 320, 512], channels=128, num_classes=1):
+    def __init__(self, in_channels=[64, 128, 320, 512], channels=128, num_classes=1, dropout=0.1):
         super(SimpleDecodeHead, self).__init__()
         
         self.in_channels = in_channels
         self.channels = channels
         self.num_classes = num_classes
+        self.dropout = nn.Dropout2d(dropout)
         
         # MLP layers for each stage
         self.linear_c4 = nn.Sequential(
@@ -449,6 +548,9 @@ class SimpleDecodeHead(nn.Module):
         # Fuse features
         _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
         
+        # Apply dropout for regularization
+        _c = self.dropout(_c)
+        
         # Final prediction
         x = self.linear_pred(_c)
         
@@ -460,54 +562,52 @@ class SimpleDecodeHead(nn.Module):
 # =========================================================================
 
 class ColonFormer(nn.Module):
-    """ColonFormer - Sử dụng logic từ code gốc mmseg"""
+    """ColonFormer - KẾ THỪA CHÍNH XÁC TỪ CODE GỐC MMSEG"""
     
     def __init__(self, config):
         super(ColonFormer, self).__init__()
         
         self.config = config
-        self.use_refinement = config.use_refinement
         
-        # Build components
-        self.backbone = SimpleBackbone()
-        self.decode_head = SimpleDecodeHead(num_classes=config.num_classes)
+        # Build backbone và decode_head như trong code gốc
+        self.backbone, backbone_channels = build_backbone(config.backbone)
+        self.decode_head = SimpleDecodeHead(in_channels=backbone_channels, num_classes=config.num_classes, dropout=config.dropout)
         
-        if self.use_refinement:
-            # CFP modules từ code gốc - CHÍNH XÁC
-            self.CFP_1 = CFPModule(128, d=8)
-            self.CFP_2 = CFPModule(320, d=8)  
-            self.CFP_3 = CFPModule(512, d=8)
-            
-            # RA-RA modules từ code gốc - CHÍNH XÁC
-            self.ra1_conv1 = Conv(128, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra1_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra1_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
-            
-            self.ra2_conv1 = Conv(320, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra2_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra2_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
-            
-            self.ra3_conv1 = Conv(512, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra3_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
-            self.ra3_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
-            
-            # Axial attention từ code gốc - CHÍNH XÁC
-            self.aa_kernel_1 = AA_kernel(128, 128)
-            self.aa_kernel_2 = AA_kernel(320, 320)
-            self.aa_kernel_3 = AA_kernel(512, 512)
+        # CFP modules for multi-scale context modeling - CHÍNH XÁC NHƯ CODE GỐC
+        self.CFP_1 = CFPModule(backbone_channels[1], d=8)  # 128 cho Simple, 64 cho MiT-B1
+        self.CFP_2 = CFPModule(backbone_channels[2], d=8)  # 320 cho Simple, 320 cho MiT-B1  
+        self.CFP_3 = CFPModule(backbone_channels[3], d=8)  # 512 cho Simple, 512 cho MiT-B1
+        
+        # RA-RA (Reverse Attention - Residual Attention) modules - CHÍNH XÁC NHƯ CODE GỐC
+        self.ra1_conv1 = Conv(backbone_channels[1], 32, 3, 1, padding=1, bn_acti=True)
+        self.ra1_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
+        self.ra1_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
+        
+        self.ra2_conv1 = Conv(backbone_channels[2], 32, 3, 1, padding=1, bn_acti=True)
+        self.ra2_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
+        self.ra2_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
+        
+        self.ra3_conv1 = Conv(backbone_channels[3], 32, 3, 1, padding=1, bn_acti=True)
+        self.ra3_conv2 = Conv(32, 32, 3, 1, padding=1, bn_acti=True)
+        self.ra3_conv3 = Conv(32, 1, 3, 1, padding=1, bn_acti=True)
+        
+        # Axial attention kernels - CHÍNH XÁC NHƯ CODE GỐC
+        self.aa_kernel_1 = AA_kernel(backbone_channels[1], backbone_channels[1])
+        self.aa_kernel_2 = AA_kernel(backbone_channels[2], backbone_channels[2])
+        self.aa_kernel_3 = AA_kernel(backbone_channels[3], backbone_channels[3])
     
     def forward(self, x):
-        """Forward pass - CHÍNH XÁC như trong code gốc"""
-        # Backbone forward
-        backbone_features = self.backbone(x)
-        x1, x2, x3, x4 = backbone_features
+        """Forward function with CFP and RA-RA refinement modules - CHÍNH XÁC NHƯ CODE GỐC"""
+        # Extract features từ backbone
+        backbone_features = self.backbone.forward_features(x) if hasattr(self.backbone, 'forward_features') else self.backbone(x)
+        x1 = backbone_features[0]  # 64x88x88 cho Simple, 32x88x88 cho MiT-B0
+        x2 = backbone_features[1]  # 128x44x44 cho Simple, 64x44x44 cho MiT-B0  
+        x3 = backbone_features[2]  # 320x22x22 cho Simple, 160x22x22 cho MiT-B0
+        x4 = backbone_features[3]  # 512x11x11 cho Simple, 256x11x11 cho MiT-B0
 
-        # Initial decoder forward
-        decoder_1 = self.decode_head([x1, x2, x3, x4])
+        # Initial decode head forward
+        decoder_1 = self.decode_head([x1, x2, x3, x4])  # 88x88
         lateral_map_1 = F.interpolate(decoder_1, scale_factor=4, mode='bilinear')
-        
-        if not self.use_refinement:
-            return lateral_map_1
         
         # REFINEMENT PROCESS - CHÍNH XÁC NHU TRONG CODE GỐC
         # ------------------- atten-one (Stage 3) -----------------------
@@ -517,7 +617,7 @@ class ColonFormer(nn.Module):
         decoder_2_ra = -1 * (torch.sigmoid(decoder_2)) + 1
         aa_atten_3 = self.aa_kernel_3(cfp_out_1)
         aa_atten_3 += cfp_out_1
-        aa_atten_3_o = decoder_2_ra.expand(-1, 512, -1, -1).mul(aa_atten_3)
+        aa_atten_3_o = decoder_2_ra.expand(-1, aa_atten_3.size(1), -1, -1).mul(aa_atten_3)
         
         ra_3 = self.ra3_conv1(aa_atten_3_o) 
         ra_3 = self.ra3_conv2(ra_3) 
@@ -533,7 +633,7 @@ class ColonFormer(nn.Module):
         decoder_3_ra = -1 * (torch.sigmoid(decoder_3)) + 1
         aa_atten_2 = self.aa_kernel_2(cfp_out_2)
         aa_atten_2 += cfp_out_2
-        aa_atten_2_o = decoder_3_ra.expand(-1, 320, -1, -1).mul(aa_atten_2)
+        aa_atten_2_o = decoder_3_ra.expand(-1, aa_atten_2.size(1), -1, -1).mul(aa_atten_2)
         
         ra_2 = self.ra2_conv1(aa_atten_2_o) 
         ra_2 = self.ra2_conv2(ra_2) 
@@ -549,7 +649,7 @@ class ColonFormer(nn.Module):
         decoder_4_ra = -1 * (torch.sigmoid(decoder_4)) + 1
         aa_atten_1 = self.aa_kernel_1(cfp_out_3)
         aa_atten_1 += cfp_out_3
-        aa_atten_1_o = decoder_4_ra.expand(-1, 128, -1, -1).mul(aa_atten_1)
+        aa_atten_1_o = decoder_4_ra.expand(-1, aa_atten_1.size(1), -1, -1).mul(aa_atten_1)
         
         ra_1 = self.ra1_conv1(aa_atten_1_o) 
         ra_1 = self.ra1_conv2(ra_1) 
@@ -558,8 +658,8 @@ class ColonFormer(nn.Module):
         x_1 = ra_1 + decoder_4
         lateral_map_5 = F.interpolate(x_1, scale_factor=8, mode='bilinear') 
         
-        # Return multi-scale outputs như code gốc
-        return lateral_map_5, lateral_map_3, lateral_map_2, lateral_map_1
+        # Return multi-scale outputs for deep supervision - CHÍNH XÁC NHƯ CODE GỐC
+        return [lateral_map_5, lateral_map_3, lateral_map_2, lateral_map_1]
 
 
 # =========================================================================
@@ -599,10 +699,10 @@ class ColonDataset(Dataset):
             self.mask_paths = self.mask_paths[:n_val]
         
         print(f"{phase} dataset: {len(self.img_paths)} samples")
-    
+
     def __len__(self):
         return len(self.img_paths)
-    
+
     def __getitem__(self, idx):
         # Load image
         img_path = self.img_paths[idx]
@@ -831,16 +931,21 @@ def main():
     parser = argparse.ArgumentParser(description='ColonFormer Training - Optimized Clean Version')
     
     # Model configs
-    parser.add_argument('--backbone', default='simple', choices=['simple'], help='Backbone architecture')
+    parser.add_argument('--backbone', default='mit_b3', choices=['tiny', 'simple', 'mit_b0', 'mit_b1', 'mit_b2', 'mit_b3', 'mit_b4', 'mit_b5'], help='Backbone architecture (tiny=2.5M, mit_b0=3.7M, simple=11.9M, mit_b1=13.7M, mit_b2=25.4M, mit_b3=45M, mit_b4=62M, mit_b5=82M)')
     parser.add_argument('--use-refinement', action='store_true', default=True, help='Use refinement modules')
     parser.add_argument('--num-classes', type=int, default=1, help='Number of classes')
     
     # Training configs
     parser.add_argument('--epochs', type=int, default=20, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=4, help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=5e-4, help='L2 regularization weight decay')
     parser.add_argument('--img-size', type=int, default=352, help='Image size')
+    
+    # Anti-overfitting configs
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization')
+    parser.add_argument('--early-stopping', type=int, default=10, help='Early stopping patience')
+    parser.add_argument('--min-lr', type=float, default=1e-7, help='Minimum learning rate for scheduler')
     
     # Loss configs
     parser.add_argument('--loss-type', default='structure', choices=['structure', 'focal', 'crossentropy', 'ce'], 
@@ -865,7 +970,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
     args = parser.parse_args()
-    
+
     # Create config
     config = Config(args)
     
@@ -901,9 +1006,9 @@ def main():
         return
     
     train_loader = DataLoader(
-        train_dataset, 
+        train_dataset,
         batch_size=config.batch_size, 
-        shuffle=True, 
+        shuffle=True,
         num_workers=config.num_workers,
         pin_memory=True
     )
@@ -918,7 +1023,7 @@ def main():
     # Build criterion
     criterion = get_loss_function(config)
     
-    # Build optimizer
+    # Build optimizer  
     if config.optimizer_type == 'adamw':
         optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     elif config.optimizer_type == 'adam':
@@ -926,13 +1031,19 @@ def main():
     elif config.optimizer_type == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum, weight_decay=config.weight_decay)
     
-    # Build scheduler
+    # Build scheduler với early stopping support
     if config.scheduler_type == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-6)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=config.min_lr)
     elif config.scheduler_type == 'step':
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
     elif config.scheduler_type == 'poly':
         scheduler = optim.lr_scheduler.PolynomialLR(optimizer, total_iters=config.epochs, power=0.9)
+    
+    # Setup adaptive learning rate scheduler cho anti-overfitting
+    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, 
+        verbose=True, min_lr=config.min_lr
+    )
     
     # TensorBoard
     writer = SummaryWriter(work_dir / 'tensorboard')
@@ -940,6 +1051,7 @@ def main():
     # Resume from checkpoint if specified
     start_epoch = 1
     best_dice = 0.0
+    early_stop_counter = 0
     
     if config.resume_from and Path(config.resume_from).exists():
         print(f"Resuming from {config.resume_from}")
@@ -949,6 +1061,7 @@ def main():
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_dice = checkpoint['best_dice']
+        early_stop_counter = checkpoint.get('early_stop_counter', 0)
     
     # Training loop
     print("Starting training loop...")
@@ -961,12 +1074,15 @@ def main():
         # Validate
         val_loss, val_metrics = validate_epoch(model, val_loader, criterion, device, config)
         
-        # Update scheduler
+        # Update schedulers
         scheduler.step()
+        plateau_scheduler.step(val_loss)  # ReduceLROnPlateau based on validation loss
         
         # Log metrics
+        current_lr = optimizer.param_groups[0]['lr']
         print(f"Train - Loss: {train_loss:.4f}, Dice: {train_metrics['dice']:.4f}, IoU: {train_metrics['iou']:.4f}")
         print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_metrics['dice']:.4f}, IoU: {val_metrics['iou']:.4f}")
+        print(f"LR: {current_lr:.2e}")
         
         # TensorBoard logging
         writer.add_scalar('Loss/Train', train_loss, epoch)
@@ -975,11 +1091,12 @@ def main():
         writer.add_scalar('Dice/Val', val_metrics['dice'], epoch)
         writer.add_scalar('IoU/Train', train_metrics['iou'], epoch)
         writer.add_scalar('IoU/Val', val_metrics['iou'], epoch)
-        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('LR', current_lr, epoch)
         
-        # Save checkpoint
+        # Early stopping check và save checkpoint
         if val_metrics['dice'] > best_dice:
             best_dice = val_metrics['dice']
+            early_stop_counter = 0  # Reset counter
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -987,10 +1104,20 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_dice': best_dice,
                 'val_metrics': val_metrics,
+                'early_stop_counter': early_stop_counter,
                 'config': config.__dict__
             }
             torch.save(checkpoint, work_dir / 'best_model.pth')
             print(f"New best model saved! Dice: {best_dice:.4f}")
+        else:
+            early_stop_counter += 1
+            print(f"No improvement for {early_stop_counter} epochs")
+            
+            # Early stopping
+            if early_stop_counter >= config.early_stopping:
+                print(f"Early stopping triggered after {early_stop_counter} epochs without improvement")
+                print(f"Best Dice: {best_dice:.4f}")
+                break
         
         # Save regular checkpoint
         if epoch % 10 == 0:
@@ -1001,6 +1128,7 @@ def main():
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_dice': best_dice,
                 'val_metrics': val_metrics,
+                'early_stop_counter': early_stop_counter,
                 'config': config.__dict__
             }
             torch.save(checkpoint, work_dir / f'checkpoint_epoch_{epoch}.pth')

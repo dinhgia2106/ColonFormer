@@ -68,10 +68,10 @@ class TestDataset(Dataset):
             count = sum(1 for sample in self.data_samples if sample['dataset'] == dataset_name)
             if count > 0:
                 print(f"  {dataset_name}: {count} samples")
-    
+
     def __len__(self):
         return len(self.data_samples)
-    
+
     def __getitem__(self, idx):
         sample = self.data_samples[idx]
         
@@ -214,7 +214,7 @@ def load_model_and_config(checkpoint_path):
                 setattr(args, attr, defaults.get(attr, None))
         
         config = Config(args)
-    else:
+        else:
         # Default config nếu không có trong checkpoint
         class Args:
             backbone = 'simple'

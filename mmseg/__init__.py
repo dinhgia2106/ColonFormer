@@ -4,7 +4,7 @@ try:
 except ImportError:
     mmcv = None
     MMCV_AVAILABLE = False
-    print("Warning: mmcv not found, running in standalone mode")
+    # print("Warning: mmcv not found, running in standalone mode")
 
 from .version import __version__, version_info
 
